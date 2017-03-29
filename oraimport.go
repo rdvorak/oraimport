@@ -16,10 +16,11 @@ import (
 	"bufio"
 )
 
-var user, password, dblink, dateFormat, nullText string
+var user, password, dblink, nlsDateFmt, nlsNumericCh, nullText string
 var comma string
-var header, useCRLF bool
-var sql, inputFile cli.StringSlice
+var bindRows, maxErrors, cntErrors int64
+var bulk bool
+var sql, sqlBegin, sqlEnd cli.StringSlice
 
 func str2orastr(rec []string) []ora.String {
 	a := make([]ora.String, len(rec))
@@ -38,12 +39,17 @@ func main() {
 	app.Flags = []cli.Flag{
 		cli.StringFlag{Name: "user, u", Destination: &user, EnvVar: "ORADB_USER"},
 		cli.StringFlag{Name: "password, p", Destination: &password, EnvVar: "ORADB_PASSWORD"},
-		cli.StringFlag{Name: "connect, c", Destination: &dblink, EnvVar: "ORADB_CONNECT", Usage: "example: \"localhost:1524/MIS.OK.AERO\""},
+		cli.StringFlag{Name: "connect, c", Destination: &dblink, EnvVar: "ORADB_CONNECT", Usage: "example: \"host:port/service\""},
+		cli.StringFlag{Name: "nlsDate", Destination: &nlsDateFmt, EnvVar: "NLS_DATE_FORMAT", Usage: "example: \"DD.MM.YYYY\""},
+		cli.StringFlag{Name: "nlsNumeric", Destination: &nlsNumericCh, EnvVar: "NLS_NUMERIC_CHARACTERS", Usage: "example: \".,\""},
+		cli.Int64Flag{Name: "bindRows", Destination: &bindRows, Value: 100000, Usage: "example: 10000"},
+		cli.Int64Flag{Name: "maxErrors", Destination: &maxErrors, Value: 0, Usage: "example: 10"},
+		cli.BoolFlag{Name: "bulk", Destination: &bulk, Value: true, Usage: "example: --bulk"},
 		cli.StringFlag{Name: "delimiter, d", Value: ",", Destination: &comma, Usage: "example: \"\\t\" for tab "},
 		cli.StringFlag{Name: "nullText", Value: "", Destination: &nullText, Usage: "The value is textual representation of oracle null values"},
 		cli.StringSliceFlag{Name: "exec, e", Value: &sql, Usage: "The command executed for each line of input: -e \"insert into TAB1 values(:v1, :v2)\""},
-		cli.StringSliceFlag{Name: "input, i", Value: &inputFile, Usage: "Input file"},
-		cli.StringFlag{Name: "dateFormat", Value: "2006-01-02T15:04:05", Destination: &dateFormat, Usage: "format is the desired textual representation of the reference time: Mon Jan 2 15:04:05 -0700 MST 2006"},
+		cli.StringSliceFlag{Name: "begin", Value: &sqlBegin, Usage: "The command executed at the begining: --begin \"delete from TAB1\""},
+		cli.StringSliceFlag{Name: "end", Value: &sqlEnd, Usage: "The command executed at the end: --end \"delete from TAB1 where col1 is null\""},
 	}
 	app.Action = func(c *cli.Context) error {
 		env, err := ora.OpenEnv(nil)
@@ -77,57 +83,109 @@ func main() {
 				log.Fatalln("Error reading standard input:", err)
 			}
 		}
-
 		if len(sql) == 0 {
 			// chybi select nebo cursor na vstupu
 			log.Fatalln("No SQL command to execute")
 		}
+
 		sqlstmt := strings.Join(sql, " ")
-		fmt.Println(sqlstmt)
+		// fmt.Println(sqlstmt)
 		stmt, err := ses.Prep(sqlstmt)
 		if err != nil {
-			log.Fatalln(sqlstmt, err)
+			log.Panicf("%s %v", "Error parsing "+sqlstmt, err)
 		}
 		defer stmt.Close()
+
+		if nlsDateFmt != "" {
+			_, err2 := ses.PrepAndExe(fmt.Sprintf("alter session set nls_date_format='%s'", nlsDateFmt))
+			if err2 != nil {
+				log.Panicf("%s %v", nlsDateFmt, err2)
+			}
+		}
+		if nlsNumericCh != "" {
+			ses.PrepAndExe(fmt.Sprintf("alter session set nls_numeric_characters='%s'", nlsNumericCh))
+		}
+
+		for _, sql := range sqlBegin {
+			_, err2 := ses.PrepAndExe(sql)
+			if err2 != nil {
+				log.Panicf("%s %v", sql, err2)
+			}
+		}
+
+		//podle poctu parametru budeme mit velikost pole pro Execute
 		numParams := stmt.NumInput()
 		batch := make([]interface{}, numParams)
 		for i := range batch {
 			batch[i] = []ora.String{}
 		}
-		for _, file := range inputFile {
-			ior, err := os.Open(file)
-			if err != nil {
-				log.Fatal("error opening file ", err)
+
+		for _, file := range c.Args() {
+			ior, err2 := os.Open(file)
+			if err2 != nil {
+				log.Fatal("error opening file ", err2)
 			}
 			csvr := csv.NewReader(ior)
+			var batchSize int64
 			for {
-				rec, err := csvr.Read()
-				if err == io.EOF {
+				rec, err2 := csvr.Read()
+				if err2 == io.EOF {
 					break
 				}
-				if err != nil {
-					log.Fatal(err)
+				if err2 != nil {
+					log.Fatal("Error reading file "+file, err2)
 				}
+				batchSize++
 				for i, val := range rec {
 					if i < numParams {
-						if val == "" {
+						if val == "" || val == nullText {
 							batch[i] = append(batch[i].([]ora.String), ora.String{IsNull: true})
 						} else {
 							batch[i] = append(batch[i].([]ora.String), ora.String{Value: val})
 						}
 					}
 				}
+				if batchSize == bindRows {
+
+					if len(batch) > 0 && len(batch[0].([]ora.String)) > 0 {
+						rows, err := stmt.Exe(batch...)
+						if err != nil {
+							cntErrors++
+							if cntErrors > maxErrors {
+								log.Fatalln(err)
+							} else {
+								fmt.Println(err)
+								if batchSize = 1 {
+									fmt.Printf("%v\n", rec)
+								}
+						}
+						fmt.Printf("%d rows", rows)
+						for i := range batch {
+							batch[i] = []ora.String{}
+						}
+						batchSize = 0
+					}
+
+				}
+
 				// fmt.Printf("%v\n", rec)
 			}
 		}
 
 		// fmt.Printf("%v\n", batch)
-		rows, err := stmt.Exe(batch...)
-		if err != nil {
-			panic(err)
+		if len(batch) > 0 && len(batch[0].([]ora.String)) > 0 {
+			rows, err := stmt.Exe(batch...)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println(rows)
 		}
-		fmt.Println(rows)
-
+		for _, sql := range sqlEnd {
+			_, err2 := ses.PrepAndExe(sql)
+			if err2 != nil {
+				log.Panicf("%s %v", sql, err2)
+			}
+		}
 		return nil
 	}
 	app.Run(os.Args)
